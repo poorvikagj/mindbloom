@@ -1,3 +1,5 @@
 .env
-.env.example
 node_modules/
+public/uploads/courses/*.jpg
+public/uploads/courses/*.png
+public/uploads/courses/*.webp

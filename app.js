@@ -1,119 +1,139 @@
-﻿const express = require("express");
-const app = express();
-const port = process.env.PORT || 5000;
-const path = require("path");
+﻿'use strict';
+
+require('dotenv').config();
+
+const express = require('express');
+const path = require('path');
 const fs = require('fs/promises');
 const { createWriteStream } = require('fs');
-const http = require('http');
 const https = require('https');
 const { pipeline } = require('stream/promises');
 const ejsMate = require('ejs-mate');
-const { randomUUID } = require('crypto');
-const methodOverride = require("method-override");
+const { randomUUID, randomBytes } = require('crypto');
+const bcrypt = require('bcrypt');
+const methodOverride = require('method-override');
 const session = require('express-session');
 const flash = require('connect-flash');
-const wrapAsync = require('./utils/wrapAsync.js');
 const cookieParser = require('cookie-parser');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+
+const wrapAsync = require('./utils/wrapAsync.js');
 const connection = require('./config/database.js');
 
+const app = express();
+const port = Number(process.env.PORT) || 5000;
+
+// ============ SECURITY HELPERS ============
+
+function getRequiredEnv(name) {
+    const value = process.env[name];
+    if (!value) {
+        throw new Error(`Missing required environment variable: ${name}`);
+    }
+    return value;
+}
+
+function getSecretOrGenerate(name) {
+    const value = process.env[name];
+    if (value && value !== 'change-me') {
+        return value;
+    }
+    console.warn(`WARNING: ${name} not set or is placeholder. Using random value (sessions will not persist across restarts).`);
+    return randomBytes(32).toString('hex');
+}
+
+const BCRYPT_ROUNDS = 12;
+const SESSION_MAX_AGE = 12 * 60 * 60 * 1000; // 12 hours
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10 MB
+
 // ============ APP CONFIGURATION ============
-app.set("view engine", "ejs");
-app.set("views", path.join(__dirname, "./views"));
+
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, './views'));
 app.engine('ejs', ejsMate);
-app.use(express.static(path.join(__dirname, "./public")));
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use(methodOverride("_method"));
+app.set('trust proxy', 1);
 
-const cookieSecret = process.env.COOKIE_SECRET || "this is DBMS Project";
-const sessionSecret = process.env.SESSION_SECRET || "yourSecretKey";
+// Security headers
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", 'https://cdn.jsdelivr.net'],
+            styleSrc: ["'self'", "'unsafe-inline'", 'https://cdn.jsdelivr.net', 'https://cdnjs.cloudflare.com', 'https://fonts.googleapis.com'],
+            fontSrc: ["'self'", 'https://fonts.gstatic.com', 'https://cdnjs.cloudflare.com'],
+            imgSrc: ["'self'", 'data:', 'https:'],
+            connectSrc: ["'self'"]
+        }
+    },
+    crossOriginEmbedderPolicy: false
+}));
 
-// Cookie parser MUST come before session
+app.use(express.static(path.join(__dirname, './public')));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+app.use(express.json({ limit: '1mb' }));
+app.use(methodOverride('_method'));
+
+const cookieSecret = getSecretOrGenerate('COOKIE_SECRET');
+const sessionSecret = getSecretOrGenerate('SESSION_SECRET');
+
 app.use(cookieParser(cookieSecret));
 
-// Session configuration - MUST come before flash
 app.use(session({
     secret: sessionSecret,
     resave: false,
-    saveUninitialized: true,
+    saveUninitialized: false,
+    name: 'mindbloom.sid',
     cookie: {
-        maxAge: 12 * 60 * 60 * 1000, // 12 hours
+        httpOnly: true,
+        maxAge: SESSION_MAX_AGE,
         secure: process.env.COOKIE_SECURE === 'true',
         sameSite: 'lax'
     }
 }));
 
-// Flash messages middleware - MUST come after session
 app.use(flash());
 
-// Global middleware for flash messages and session data
+// Rate limiter for auth routes
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 20,
+    message: 'Too many attempts. Please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false
+});
+
+// Global locals middleware
 app.use((req, res, next) => {
-    res.locals.success = req.flash("success");
-    res.locals.error = req.flash("error");
+    res.locals.success = req.flash('success');
+    res.locals.error = req.flash('error');
     res.locals.isLoggedIn = req.session.isLoggedIn || false;
     res.locals.currentUser = req.session.user || null;
     res.locals.currentAdmin = req.session.admin || null;
-    res.locals.isAdmin = (req.session.admin && req.session.admin.isAdmin) || false;
+    res.locals.isAdmin = Boolean(req.session.admin && req.session.admin.isAdmin);
     next();
 });
 
-
-
 // ============ MIDDLEWARE FUNCTIONS ============
 
-function checkAdmin(req, res, next) {
-    console.log('checkAdmin called, session exists:', !!req.session);
-
-    const { username, password } = req.body;
-    const qa = "SELECT * FROM admins WHERE username = ?";
-
-    connection.query(qa, [username], (err, results) => {
-        if (err) {
-            console.log(err);
-            return res.send("Error checking admin status.");
-        }
-
-        if (results.length > 0 && password === results[0].password) {
-            console.log('Admin login successful, setting session...');
-
-            // Store admin session data
-            req.session.admin = {
-                id: results[0].id,
-                username: results[0].username,
-                isAdmin: true
-            };
-            req.session.user_id = results[0].id;
-            req.session.isLoggedIn = true;
-
-            console.log('Session set, about to use flash...');
-            res.cookie('admin', results[0].id, { httpOnly: true });
-
-            // Direct flash usage - no async operations
-            req.flash('success', 'Login successful as admin!');
-            return res.redirect('/mindbloom');
-        }
-
-        // If not admin, proceed to user login
-        return next();
-    });
-}
-// Require login middleware
 function requireLogin(req, res, next) {
     if (!req.session.isLoggedIn || !req.session.user_id) {
         req.flash('error', 'Please login to access this page.');
         return res.redirect('/mindbloom/login');
     }
-    next();
+    return next();
 }
 
-// Require admin middleware
 function requireAdmin(req, res, next) {
     if (!req.session.admin || !req.session.admin.isAdmin) {
         req.flash('error', 'Admin access required.');
         return res.redirect('/mindbloom/login');
     }
-    next();
+    return next();
 }
+
+// ============ UTILITY FUNCTIONS ============
 
 function buildTeacherEmail(tname) {
     const localPart = String(tname || '')
@@ -126,51 +146,102 @@ function buildTeacherEmail(tname) {
 }
 
 function getImageExtension(contentType) {
-    const normalizedType = String(contentType || '').toLowerCase();
-
-    if (normalizedType.includes('jpeg') || normalizedType.includes('jpg')) return '.jpg';
-    if (normalizedType.includes('png')) return '.png';
-    if (normalizedType.includes('webp')) return '.webp';
-    if (normalizedType.includes('gif')) return '.gif';
-    if (normalizedType.includes('svg')) return '.svg';
-
+    const type = String(contentType || '').toLowerCase();
+    if (type.includes('png')) return '.png';
+    if (type.includes('webp')) return '.webp';
+    if (type.includes('gif')) return '.gif';
+    if (type.includes('svg')) return '.svg';
     return '.jpg';
 }
 
+function isDatabaseConnectionError(error) {
+    const connectionCodes = ['ENOTFOUND', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'];
+    return Boolean(error && connectionCodes.includes(error.code));
+}
+
+async function queryOrFallback(text, params, fallback = []) {
+    try {
+        return await connection.query(text, params);
+    } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+            return fallback;
+        }
+        throw error;
+    }
+}
+
+async function hashPassword(password) {
+    return bcrypt.hash(password, BCRYPT_ROUNDS);
+}
+
+async function verifyPassword(plaintext, storedPassword) {
+    const stored = String(storedPassword || '');
+    if (!stored) {
+        return false;
+    }
+    if (stored.startsWith('$2')) {
+        return bcrypt.compare(plaintext, stored);
+    }
+    // Legacy plaintext comparison — passwords should be migrated to bcrypt
+    return plaintext === stored;
+}
+
+/**
+ * Downloads a course image from a given HTTPS URL and stores it locally.
+ * Only HTTPS URLs are accepted to prevent SSRF attacks on internal services.
+ */
 async function persistCourseImage(imageUrl, courseId) {
     const trimmedUrl = String(imageUrl || '').trim();
-
     if (!trimmedUrl) {
         return '';
     }
 
+    let parsedUrl;
     try {
-        const parsedUrl = new URL(trimmedUrl);
+        parsedUrl = new URL(trimmedUrl);
+    } catch {
+        return trimmedUrl;
+    }
 
-        if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-            return trimmedUrl;
-        }
-    } catch (error) {
+    // Only allow HTTPS to prevent SSRF on internal networks
+    if (parsedUrl.protocol !== 'https:') {
+        return trimmedUrl;
+    }
+
+    // Block private/internal IP ranges
+    const hostname = parsedUrl.hostname.toLowerCase();
+    if (
+        hostname === 'localhost' ||
+        hostname === '127.0.0.1' ||
+        hostname.startsWith('10.') ||
+        hostname.startsWith('192.168.') ||
+        hostname.startsWith('172.') ||
+        hostname.endsWith('.local') ||
+        hostname === '0.0.0.0'
+    ) {
         return trimmedUrl;
     }
 
     try {
         const downloadResult = await new Promise((resolve, reject) => {
-            const parsedUrl = new URL(trimmedUrl);
-            const client = parsedUrl.protocol === 'http:' ? http : https;
-
-            const request = client.get(parsedUrl, (response) => {
+            const request = https.get(parsedUrl, { timeout: 10000 }, (response) => {
                 if (response.statusCode !== 200) {
                     response.resume();
-                    reject(new Error(`Image request failed with status ${response.statusCode}`));
+                    reject(new Error(`Image download failed with status ${response.statusCode}`));
                     return;
                 }
 
-                const contentType = response.headers['content-type'] || '';
-
-                if (!contentType.toLowerCase().startsWith('image/')) {
+                const contentType = String(response.headers['content-type'] || '').toLowerCase();
+                if (!ALLOWED_IMAGE_TYPES.some((allowed) => contentType.includes(allowed))) {
                     response.resume();
-                    reject(new Error(`Unsupported content type: ${contentType}`));
+                    reject(new Error(`Disallowed content type: ${contentType}`));
+                    return;
+                }
+
+                const contentLength = Number(response.headers['content-length'] || 0);
+                if (contentLength > MAX_IMAGE_SIZE) {
+                    response.resume();
+                    reject(new Error('Image exceeds maximum allowed size'));
                     return;
                 }
 
@@ -178,6 +249,10 @@ async function persistCourseImage(imageUrl, courseId) {
             });
 
             request.on('error', reject);
+            request.on('timeout', () => {
+                request.destroy();
+                reject(new Error('Image download timed out'));
+            });
         });
 
         const uploadsDir = path.join(__dirname, 'public', 'uploads', 'courses');
@@ -189,63 +264,41 @@ async function persistCourseImage(imageUrl, courseId) {
 
         return `/uploads/courses/${fileName}`;
     } catch (error) {
-        console.log('Course image fallback:', trimmedUrl, error.message);
+        console.warn('Course image download failed, using original URL:', error.message);
         return trimmedUrl;
     }
 }
 
-function createCourseWithImage(coursePayload, callback) {
-    const { courseId, title, description, video, teacherId, imgLink, vidLink } = coursePayload;
-    const insertQuery = `INSERT INTO courses (CID, TITLE, DESCRIP, VIDEO, TID, IMGLINK, VIDLINK) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-
-    persistCourseImage(imgLink, courseId)
-        .then((storedImagePath) => {
-            callback(null, [courseId, title, description, video, teacherId, storedImagePath, vidLink]);
-        })
-        .catch((imageErr) => {
-            callback(imageErr);
-        });
-}
-
-function findOrCreateTeacherId(tname, callback) {
+async function findOrCreateTeacherId(tname) {
     const teacherName = String(tname || '').trim();
-
     if (!teacherName) {
-        return callback(new Error('Teacher username is required.'));
+        throw new Error('Teacher username is required.');
     }
 
-    const lookupQuery = `SELECT TID FROM teachers WHERE TNAME = ?`;
+    const teacherResult = await connection.query(
+        'SELECT TID FROM teachers WHERE TNAME = ?',
+        [teacherName]
+    );
 
-    connection.query(lookupQuery, [teacherName], (lookupErr, teacherResult) => {
-        if (lookupErr) {
-            return callback(lookupErr);
-        }
+    if (teacherResult.length > 0) {
+        return { teacherId: teacherResult[0].TID, created: false };
+    }
 
-        if (teacherResult.length > 0) {
-            return callback(null, teacherResult[0].TID, false);
-        }
+    const teacherId = randomUUID();
+    const teacherEmail = buildTeacherEmail(teacherName);
+    await connection.query(
+        'INSERT INTO teachers (TID, TNAME, EMAIL, BIO, PASS, SPECIAL) VALUES (?, ?, ?, ?, ?, ?)',
+        [teacherId, teacherName, teacherEmail, 'The instructor teaches this course', '', 'General']
+    );
 
-        const teacherId = randomUUID();
-        const insertTeacherQuery = `INSERT INTO teachers (TID, TNAME, EMAIL, BIO, PASS, SPECIAL) VALUES (?, ?, ?, ?, ?, ?)`;
-        const teacherEmail = buildTeacherEmail(teacherName);
-
-        connection.query(
-            insertTeacherQuery,
-            [teacherId, teacherName, teacherEmail, 'The instructor teaches this course', '', 'General'],
-            (insertErr) => {
-                if (insertErr) {
-                    return callback(insertErr);
-                }
-
-                return callback(null, teacherId, true);
-            }
-        );
-    });
+    return { teacherId, created: true };
 }
 
 async function ensureTextColumns() {
     const migrations = [
+        'ALTER TABLE users ALTER COLUMN PSWD TYPE TEXT USING PSWD::TEXT',
         'ALTER TABLE teachers ALTER COLUMN BIO TYPE TEXT USING BIO::TEXT',
+        'ALTER TABLE teachers ALTER COLUMN PASS TYPE TEXT USING PASS::TEXT',
         'ALTER TABLE courses ALTER COLUMN DESCRIP TYPE TEXT USING DESCRIP::TEXT'
     ];
 
@@ -253,129 +306,147 @@ async function ensureTextColumns() {
         try {
             await connection.pool.query(statement);
         } catch (error) {
+            // Skip if table/column doesn't exist
             if (error.code === '42P01' || error.code === '42703') {
                 continue;
             }
-
+            if (isDatabaseConnectionError(error)) {
+                console.warn('Skipping schema migration — database unreachable:', error.message);
+                return;
+            }
             throw error;
         }
     }
 }
 
-// ============ AUTHENTICATION ROUTES ============
+// ============ ROUTES ============
 
-// Registration form
+app.get('/', (req, res) => {
+    return res.redirect('/mindbloom');
+});
+
+// ---- Authentication ----
+
 app.get('/mindbloom/signup', (req, res) => {
-    // If already logged in, redirect to home
     if (req.session.isLoggedIn) {
         return res.redirect('/mindbloom');
     }
-    res.render('listings/signup.ejs');
+    return res.render('listings/signup.ejs');
 });
 
-// Handle registration
-app.post('/mindbloom/signup', wrapAsync(async (req, res) => {
-    const { username, email, password } = req.body;
-    const uuid = randomUUID();
-    const q = 'INSERT INTO users (USERID, UNAME, EMAIL, PSWD) VALUES (?, ?, ?, ?)';
+app.post('/mindbloom/signup', authLimiter, wrapAsync(async (req, res) => {
+    const username = String(req.body.username || '').trim();
+    const email = String(req.body.email || '').trim();
+    const password = String(req.body.password || '');
 
-    connection.query(q, [uuid, username, email, password], (err) => {
-        if (err) {
-            console.log(err);
-            return res.send("Registration error.");
+    if (!username || !email || !password) {
+        req.flash('error', 'All fields are required.');
+        return res.redirect('/mindbloom/signup');
+    }
+
+    if (password.length < 8) {
+        req.flash('error', 'Password must be at least 8 characters.');
+        return res.redirect('/mindbloom/signup');
+    }
+
+    const uuid = randomUUID();
+    const hashedPassword = await hashPassword(password);
+
+    try {
+        await connection.query(
+            'INSERT INTO users (USERID, UNAME, EMAIL, PSWD) VALUES (?, ?, ?, ?)',
+            [uuid, username, email, hashedPassword]
+        );
+    } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+            req.flash('error', 'Registration is unavailable while the database is offline.');
+            return res.redirect('/mindbloom/signup');
         }
-        // Auto-login: create session and redirect to home
-        req.session.user = {
-            id: uuid,
-            username: username,
-            email: email,
-            isAdmin: false
-        };
-        req.session.user_id = uuid;
-        req.session.isLoggedIn = true;
-        res.cookie('user_id', uuid, { httpOnly: true });
-        req.flash('success', 'Registration successful - you are now logged in.');
-        // Save the session and redirect to home so the next request shows logged-in UI
-        req.session.save((saveErr) => {
-            if (saveErr) console.log('Session save error after signup:', saveErr);
-            return res.redirect('/mindbloom');
-        });
+        throw error;
+    }
+
+    req.session.user = { id: uuid, username, email, isAdmin: false };
+    req.session.user_id = uuid;
+    req.session.isLoggedIn = true;
+    req.flash('success', 'Registration successful — you are now logged in.');
+
+    await new Promise((resolve, reject) => {
+        req.session.save((err) => (err ? reject(err) : resolve()));
     });
+
+    return res.redirect('/mindbloom');
 }));
 
-// Login form
 app.get('/mindbloom/login', (req, res) => {
-    // If already logged in, redirect to home
     if (req.session.isLoggedIn) {
         return res.redirect('/mindbloom');
     }
-    res.render('listings/login.ejs');
+    return res.render('listings/login.ejs');
 });
 
-// Handle login (checks admin first, then user)
-app.post('/mindbloom/login', checkAdmin, (req, res) => {
-    const { username, password } = req.body;
-    const q = 'SELECT * FROM users WHERE UNAME = ?';
+app.post('/mindbloom/login', authLimiter, wrapAsync(async (req, res) => {
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '');
 
-    connection.query(q, [username], async (err, results) => {
-        if (err || results.length === 0) {
-            req.flash("error", "Invalid username or password.");
+    let adminResults;
+    try {
+        adminResults = await connection.query('SELECT * FROM admins WHERE username = ?', [username]);
+    } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+            req.flash('error', 'Login is unavailable while the database is offline.');
             return res.redirect('/mindbloom/login');
         }
+        throw error;
+    }
 
-        const user = results[0];
-        if (password === user.PSWD) {
-            // Store user session data
-            req.session.user = {
-                id: user.USERID,
-                username: user.UNAME,
-                email: user.EMAIL,
-                isAdmin: false
-            };
-            req.session.user_id = user.USERID;
-            req.session.isLoggedIn = true;
+    if (adminResults.length > 0 && await verifyPassword(password, adminResults[0].password)) {
+        req.session.admin = { id: adminResults[0].id, username: adminResults[0].username, isAdmin: true };
+        req.session.user_id = adminResults[0].id;
+        req.session.isLoggedIn = true;
+        req.flash('success', 'Login successful as admin!');
+        return res.redirect('/mindbloom');
+    }
 
-            res.cookie('user_id', user.USERID, { httpOnly: true });
-            req.flash('success', 'Login successful!');
-            res.redirect('/mindbloom');
-        } else {
-            req.flash("error", "Invalid username or password.");
-            res.redirect('/mindbloom/login');
+    let results;
+    try {
+        results = await connection.query('SELECT * FROM users WHERE UNAME = ?', [username]);
+    } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+            req.flash('error', 'Login is unavailable while the database is offline.');
+            return res.redirect('/mindbloom/login');
         }
-    });
-});
+        throw error;
+    }
 
-// Logout
+    if (results.length === 0 || !(await verifyPassword(password, results[0].PSWD))) {
+        req.flash('error', 'Invalid username or password.');
+        return res.redirect('/mindbloom/login');
+    }
+
+    const user = results[0];
+    req.session.user = { id: user.USERID, username: user.UNAME, email: user.EMAIL, isAdmin: false };
+    req.session.user_id = user.USERID;
+    req.session.isLoggedIn = true;
+    req.flash('success', 'Login successful!');
+    return res.redirect('/mindbloom');
+}));
+
 app.get('/mindbloom/logout', (req, res) => {
-    // Clear cookies
-    res.clearCookie('user_id');
-    res.clearCookie('admin');
-
-    // Destroy session
-    req.session.destroy((err) => {
-        if (err) {
-            console.log(err);
-            return res.redirect('/mindbloom');
-        }
-        res.redirect('/mindbloom');
+    req.session.destroy(() => {
+        res.clearCookie('mindbloom.sid');
+        return res.redirect('/mindbloom');
     });
 });
 
-// ============ MAIN APPLICATION ROUTES ============
+// ---- Course Listing ----
 
-// Home page - Show all courses
-app.get("/mindbloom", (req, res) => {
-    let q = 'SELECT * FROM courses';
-    connection.query(q, (err, result) => {
-        if (err) throw err;
-        res.render("listings/home.ejs", { result });
-    });
-});
+app.get('/mindbloom', wrapAsync(async (req, res) => {
+    const result = await queryOrFallback('SELECT * FROM courses', [], []);
+    return res.render('listings/home.ejs', { result });
+}));
 
-// Search courses
-app.get("/mindbloom/search", (req, res) => {
-    const searchTerm = (req.query.q || "").trim();
-
+app.get('/mindbloom/search', wrapAsync(async (req, res) => {
+    const searchTerm = String(req.query.q || '').trim();
     if (!searchTerm) {
         return res.redirect('/mindbloom');
     }
@@ -389,325 +460,202 @@ app.get("/mindbloom/search", (req, res) => {
            OR courses.DESCRIP LIKE ?
            OR teachers.TNAME LIKE ?
     `;
+    const result = await queryOrFallback(q, [like, like, like], []);
+    return res.render('listings/home.ejs', { result });
+}));
 
-    connection.query(q, [like, like, like], (err, result) => {
-        if (err) throw err;
-        res.render("listings/home.ejs", { result });
-    });
-});
+app.get('/mindbloom/teachers/:tid', wrapAsync(async (req, res) => {
+    const { tid } = req.params;
+    const q = 'SELECT * FROM courses JOIN teachers ON courses.TID = teachers.TID WHERE teachers.TID = ?';
+    const result = await queryOrFallback(q, [tid], []);
 
-// Show courses by teacher
-app.get("/mindbloom/teachers/:tid", (req, res) => {
-    let { tid } = req.params;
-    let q = `SELECT * FROM courses JOIN teachers ON courses.TID = teachers.TID WHERE teachers.TID = ?`;
+    if (result.length === 0) {
+        req.flash('error', 'Teacher profile is unavailable right now.');
+        return res.redirect('/mindbloom');
+    }
+    return res.render('listings/teachershow.ejs', { result });
+}));
 
-    connection.query(q, [tid], (err, result) => {
-        if (err) throw err;
-        res.render("listings/teachershow.ejs", { result });
-    });
-});
+app.get('/mindbloom/course/:id', wrapAsync(async (req, res) => {
+    const { id } = req.params;
+    const ad = req.session.admin;
+    const userId = req.session.user ? req.session.user.id : null;
 
-// Show course details
-app.get("/mindbloom/course/:id", (req, res) => {
-    let { id } = req.params;
-    let ad = req.session.admin;
-    let userId = req.session.user ? req.session.user.id : null;
-    let q = `SELECT * FROM courses JOIN teachers ON courses.TID = teachers.TID WHERE CID = ?`;
+    const result = await queryOrFallback(
+        'SELECT * FROM courses JOIN teachers ON courses.TID = teachers.TID WHERE CID = ?',
+        [id],
+        []
+    );
 
-    connection.query(q, [id], (err, result) => {
-        if (err) throw err;
+    if (result.length === 0) {
+        req.flash('error', 'Course not found.');
+        return res.redirect('/mindbloom');
+    }
 
-        if (!userId) {
-            return res.render("listings/show.ejs", {
-                result,
-                userId,
-                ad,
-                isEnrolled: false
-            });
-        }
+    let isEnrolled = false;
+    if (userId) {
+        const enrollmentResult = await queryOrFallback(
+            'SELECT 1 FROM enrollments WHERE USERID = ? AND CID = ? LIMIT 1',
+            [userId, id],
+            []
+        );
+        isEnrolled = enrollmentResult.length > 0;
+    }
 
-        const enrollmentQuery = `SELECT 1 FROM enrollments WHERE USERID = ? AND CID = ? LIMIT 1`;
+    return res.render('listings/show.ejs', { result, userId, ad, isEnrolled });
+}));
 
-        connection.query(enrollmentQuery, [userId, id], (enrollmentErr, enrollmentResult) => {
-            if (enrollmentErr) throw enrollmentErr;
+// ---- Enrollments ----
 
-            res.render("listings/show.ejs", {
-                result,
-                userId,
-                ad,
-                isEnrolled: enrollmentResult.length > 0
-            });
-        });
-    });
-});
-
-// ============ enrollments ROUTES ============
-
-// Enroll in course
-app.post('/mindbloom/course/:id/enroll', requireLogin, async (req, res) => {
+app.post('/mindbloom/course/:id/enroll', requireLogin, wrapAsync(async (req, res) => {
     const userId = req.session.user_id;
     const courseId = req.params.id;
-    const eid = randomUUID();
 
+    const existing = await connection.query(
+        'SELECT 1 FROM enrollments WHERE USERID = ? AND CID = ?',
+        [userId, courseId]
+    );
 
-    try {
-        // Check if user is already enrolled
-        const checkQuery = "SELECT * FROM enrollments WHERE USERID = ? AND CID = ?";
-
-        const checkEnrollment = new Promise((resolve, reject) => {
-            connection.query(checkQuery, [userId, courseId], (err, results) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(results);
-                }
-            });
-        });
-
-        const existingEnrollment = await checkEnrollment;
-
-        if (existingEnrollment.length > 0) {
-            req.flash('error', 'You are already enrolled in this course.');
-            return res.redirect(`/mindbloom/course/${courseId}`);
-        }
-
-        // Insert new enrollment
-        const insertQuery = "INSERT INTO enrollments (EID, USERID, CID) VALUES (?, ?, ?)";
-
-        const insertEnrollment = new Promise((resolve, reject) => {
-            connection.query(insertQuery, [eid, userId, courseId], (err, results) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(results);
-                }
-            });
-        });
-
-        await insertEnrollment;
-
-        req.flash('success', 'Enrolled successfully!');
-        res.redirect(`/mindbloom/course/${courseId}`);
-
-    } catch (error) {
-        console.error('Enrollment error:', error);
-        req.flash('error', 'Error processing enrollment request.');
-        res.redirect(`/mindbloom/course/${courseId}`);
+    if (existing.length > 0) {
+        req.flash('error', 'You are already enrolled in this course.');
+        return res.redirect(`/mindbloom/course/${courseId}`);
     }
-});
 
-//View the profile
-app.get('/mindbloom/profile', requireLogin, (req, res) => {
+    const eid = randomUUID();
+    await connection.query(
+        'INSERT INTO enrollments (EID, USERID, CID) VALUES (?, ?, ?)',
+        [eid, userId, courseId]
+    );
+
+    req.flash('success', 'Enrolled successfully!');
+    return res.redirect(`/mindbloom/course/${courseId}`);
+}));
+
+// ---- Profile ----
+
+app.get('/mindbloom/profile', requireLogin, wrapAsync(async (req, res) => {
     const userId = req.session.user.id;
-    
-    const userQuery = 'SELECT USERID, UNAME, EMAIL, IMG FROM users WHERE USERID = ?';
-    
-    // Fixed query to get enrolled courses with course details
-    const enrolledCoursesQuery = `
-        SELECT 
-            c.CID,
-            c.TITLE,
-            c.DESCRIP,
-            c.VIDEO,
-            c.IMGLINK,
-            c.VIDLINK,
-            t.TNAME,
-            t.EMAIL as teachers_EMAIL
-        FROM enrollments e
-        JOIN courses c ON e.CID = c.CID
-        JOIN teachers t ON c.TID = t.TID
-        WHERE e.USERID = ?
-    `;
-    
-    // Execute user query first
-    connection.query(userQuery, [userId], (err, userResult) => {
-        if (err) {
-            console.log('Error fetching user:', err);
-            req.flash('error', 'Error loading profile.');
-            return res.redirect('/mindbloom');
-        }
-        
-        if (userResult.length === 0) {
-            req.flash('error', 'User not found.');
-            return res.redirect('/mindbloom');
-        }
-        
-        const user = userResult[0];
-        
-        // Execute enrolled courses query
-        connection.query(enrolledCoursesQuery, [userId], (err, coursesResult) => {
-            if (err) {
-                console.log('Error fetching enrolled courses:', err);
-                req.flash('error', 'Error loading enrolled courses.');
-                return res.redirect('/mindbloom');
-            }
-            
-            // Debug logging
-            console.log('User data:', user);
-            console.log('Enrolled courses:', coursesResult);
-            
-            res.render('listings/profile.ejs', {
-                user: user,
-                enrolledCourses: coursesResult,
-                currentUser: req.session.user
-            });
-        });
+
+    const userResult = await connection.query(
+        'SELECT USERID, UNAME, EMAIL, IMG FROM users WHERE USERID = ?',
+        [userId]
+    );
+
+    if (userResult.length === 0) {
+        req.flash('error', 'User not found.');
+        return res.redirect('/mindbloom');
+    }
+
+    const enrolledCourses = await connection.query(
+        `SELECT c.CID, c.TITLE, c.DESCRIP, c.VIDEO, c.IMGLINK, c.VIDLINK,
+                t.TNAME, t.EMAIL as teachers_EMAIL
+         FROM enrollments e
+         JOIN courses c ON e.CID = c.CID
+         JOIN teachers t ON c.TID = t.TID
+         WHERE e.USERID = ?`,
+        [userId]
+    );
+
+    return res.render('listings/profile.ejs', {
+        user: userResult[0],
+        enrolledCourses,
+        currentUser: req.session.user
     });
-});
-// ============ courses CRUD ROUTES (ADMIN ONLY) ============
+}));
 
-// Add new course form
-app.get('/mindbloom/courses/new', requireAdmin, (req, res) => {
-    const teachersQuery = `SELECT * FROM teachers`;
+// ---- Admin Course CRUD ----
 
-    connection.query(teachersQuery, (err, teachers) => {
-        if (err) {
-            console.log(err);
-            req.flash('error', 'Error fetching teachers.');
-            return res.redirect('/mindbloom');
-        }
+app.get('/mindbloom/courses/new', requireAdmin, wrapAsync(async (req, res) => {
+    const teachers = await connection.query('SELECT * FROM teachers');
+    return res.render('listings/newcourse.ejs', { teachers });
+}));
 
-        res.render('listings/newcourse.ejs', { teachers });
-    });
-});
-
-//Posting new course
-app.post('/mindbloom/courses', requireAdmin, (req, res) => {
+app.post('/mindbloom/courses', requireAdmin, wrapAsync(async (req, res) => {
     const { title, description, video, tname, imgLink, vidLink } = req.body;
+    const { teacherId, created: teacherCreated } = await findOrCreateTeacherId(tname);
+    const courseId = randomUUID();
+    const storedImagePath = await persistCourseImage(imgLink, courseId);
 
-    findOrCreateTeacherId(tname, (teacherErr, teacherId, teacherCreated) => {
-        if (teacherErr) {
-            console.log(teacherErr);
-            req.flash('error', 'Error preparing teacher account.');
-            return res.redirect('/mindbloom/courses/new');
-        }
+    await connection.query(
+        'INSERT INTO courses (CID, TITLE, DESCRIP, VIDEO, TID, IMGLINK, VIDLINK) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [courseId, title, description, video, teacherId, storedImagePath, vidLink]
+    );
 
-        const courseId = randomUUID();
+    const msg = teacherCreated
+        ? 'Teacher account created and course added successfully!'
+        : 'Course created successfully!';
+    req.flash('success', msg);
+    return res.redirect(`/mindbloom/course/${courseId}`);
+}));
 
-        createCourseWithImage(
-            { courseId, title, description, video, teacherId, imgLink, vidLink },
-            (imageErr, values) => {
-                if (imageErr) {
-                    console.log(imageErr);
-                    req.flash('error', 'Error preparing course image.');
-                    return res.redirect('/mindbloom/courses/new');
-                }
-
-                const insertQuery = `INSERT INTO courses (CID, TITLE, DESCRIP, VIDEO, TID, IMGLINK, VIDLINK) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-
-                connection.query(insertQuery, values, (err, result) => {
-                    if (err) {
-                        console.log(err);
-                        req.flash('error', 'Error creating course.');
-                        return res.redirect('/mindbloom/courses/new');
-                    }
-
-                    req.flash('success', teacherCreated ? 'Teacher account created and course added successfully!' : 'Course created successfully!');
-                    res.redirect(`/mindbloom/course/${courseId}`);
-                });
-            }
-        );
-    });
-});
-
-// Get edit form for course
-app.get('/mindbloom/course/:id/edit', requireAdmin, (req, res) => {
+app.get('/mindbloom/course/:id/edit', requireAdmin, wrapAsync(async (req, res) => {
     const courseId = req.params.id;
-    const courseQuery = `SELECT * FROM courses WHERE CID = ?`;
-    const teachersQuery = `SELECT * FROM teachers,courses WHERE teachers.TID=courses.TID`;
+    const courseResult = await connection.query('SELECT * FROM courses WHERE CID = ?', [courseId]);
 
-    connection.query(courseQuery, [courseId], (err, courseResult) => {
-        if (err) {
-            console.log(err);
-            req.flash('error', 'Error fetching course details.');
-            return res.redirect('/mindbloom');
-        }
+    if (courseResult.length === 0) {
+        req.flash('error', 'Course not found.');
+        return res.redirect('/mindbloom');
+    }
 
-        if (courseResult.length === 0) {
-            req.flash('error', 'Course not found.');
-            return res.redirect('/mindbloom');
-        }
-
-        connection.query(teachersQuery, (err, teachersResult) => {
-            if (err) {
-                console.log(err);
-                req.flash('error', 'Error fetching teachers.');
-                return res.redirect('/mindbloom');
-            }
-
-            res.render('listings/editcourse.ejs', {
-                course: courseResult[0],
-                teachers: teachersResult[0]
-            });
-        });
+    const teachersResult = await connection.query('SELECT * FROM teachers WHERE TID = ?', [courseResult[0].TID]);
+    return res.render('listings/editcourse.ejs', {
+        course: courseResult[0],
+        teachers: teachersResult[0] || null
     });
-});
+}));
 
-// Update course
-app.put('/mindbloom/course/:id', requireAdmin, (req, res) => {
+app.put('/mindbloom/course/:id', requireAdmin, wrapAsync(async (req, res) => {
     const courseId = req.params.id;
     const { title, description, video, tname, imglink, vidLink } = req.body;
+    const { teacherId, created: teacherCreated } = await findOrCreateTeacherId(tname);
+    const storedImagePath = await persistCourseImage(imglink, courseId);
 
-    findOrCreateTeacherId(tname, (teacherErr, teacherId, teacherCreated) => {
-        if (teacherErr) {
-            console.log(teacherErr);
-            req.flash('error', 'Error preparing teacher account.');
-            return res.redirect('/mindbloom/courses/new');
-        }
+    await connection.query(
+        'UPDATE courses SET TITLE = ?, DESCRIP = ?, VIDEO = ?, TID = ?, IMGLINK = ?, VIDLINK = ? WHERE CID = ?',
+        [title, description, video, teacherId, storedImagePath, vidLink, courseId]
+    );
 
-        persistCourseImage(imglink, courseId)
-            .then((storedImagePath) => {
-                const updateQuery = `UPDATE courses SET TITLE = ?, DESCRIP = ?, VIDEO = ?, TID = ?, IMGLINK = ?, VIDLINK = ? WHERE CID = ?`;
+    const msg = teacherCreated
+        ? 'Teacher account created and course updated successfully!'
+        : 'Course updated successfully!';
+    req.flash('success', msg);
+    return res.redirect(`/mindbloom/course/${courseId}`);
+}));
 
-                connection.query(updateQuery, [title, description, video, teacherId, storedImagePath, vidLink, courseId], (err, result) => {
-                    if (err) {
-                        console.log(err);
-                        req.flash('error', 'Error updating course.');
-                        return res.redirect('/mindbloom/courses/new');
-                    }
+app.delete('/mindbloom/course/:id', requireAdmin, wrapAsync(async (req, res) => {
+    const courseId = req.params.id;
+    await connection.query('DELETE FROM courses WHERE CID = ?', [courseId]);
+    req.flash('success', 'Course deleted successfully!');
+    return res.redirect('/mindbloom');
+}));
 
-                    req.flash('success', teacherCreated ? 'Teacher account created and course updated successfully!' : 'Course updated successfully!');
-                    res.redirect(`/mindbloom/course/${courseId}`);
-                });
-            })
-            .catch((imageErr) => {
-                console.log(imageErr);
-                req.flash('error', 'Error preparing course image.');
-                return res.redirect('/mindbloom/courses/new');
-            });
-    });
+// ============ ERROR HANDLING ============
+
+// 404 handler
+app.use((req, res) => {
+    res.status(404).render('listings/home.ejs', { result: [] });
 });
 
-// Delete course
-app.delete('/mindbloom/course/:id', requireAdmin, (req, res) => {
-    const courseId = req.params.id;
-    const q = 'DELETE FROM courses WHERE CID = ?';
-
-    connection.query(q, [courseId], (err, result) => {
-        if (err) {
-            console.log(err);
-            req.flash('error', 'Error deleting course.');
-            return res.redirect('/mindbloom');
-        }
-
-        req.flash('success', 'Course deleted successfully!');
-        res.redirect('/mindbloom');
-    });
+// Global error handler
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err.message);
+    req.flash('error', 'Something went wrong. Please try again.');
+    return res.redirect('/mindbloom');
 });
 
 // ============ SERVER STARTUP ============
+
 if (require.main === module && !process.env.VERCEL) {
     ensureTextColumns()
         .then(() => {
             app.listen(port, () => {
-                console.log(`Backend server running on port ${port}`);
+                console.log(`MindBloom server running on port ${port}`);
             });
         })
         .catch((error) => {
-            console.error('Failed to prepare database schema:', error);
+            console.error('Failed to prepare database schema:', error.message);
             process.exit(1);
         });
 }
 
 module.exports = app;
-
